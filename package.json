@@ -1,0 +1,13 @@
+{
+  "name": "cryptobot-pro",
+  "version": "10.0.0",
+  "description": "Automated BTC futures trading bot with CRT strategy and DeepSeek AI confirmation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}
