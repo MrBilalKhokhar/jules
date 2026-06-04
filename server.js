@@ -16,8 +16,10 @@ const fs     = require('fs');
 const PORT          = process.env.PORT || 3000;
 const BOT_PIN       = process.env.BOT_PIN || '123456';
 const STATE_FILE    = './bot_state.json';
-const KEYS_FILE     = './bot_keys.enc';
+const KEYS_FILE     = './bot_keys.enc';   // stores MEXC + AI keys, all encrypted
 const ENC_PASSPHRASE = process.env.ENC_PASSPHRASE || 'cryptobot-default-passphrase-change-me';
+const BALANCE_FETCH_MS = 60000;            // refresh wallet balance every 60s
+const LOG_BUFFER_SIZE  = 200;              // keep last 200 log lines for /logs
 
 const MEXC_BASE     = 'https://contract.mexc.com';
 const MEXC_PRICE    = 'https://contract.mexc.com/api/v1/contract/ticker';
@@ -68,6 +70,7 @@ let state = {
     recentTrades: [], lossStreak: 0
   },
   ai: { confidence: 65, lastDecision: null, hasKey: false },
+  balance: { usdt: 0, fetchedAt: 0, error: null },
   lastTick: null,
   lastCandleTime: null,
   candles: [],     // last 50 completed candles
@@ -88,8 +91,11 @@ const runtime = {
     lastSignatureUsed: '',
     lastEntryAt: 0
   },
-  intervals: { tick: null, sync: null, save: null }
+  intervals: { tick: null, sync: null, save: null, balance: null }
 };
+
+// In-memory log buffer (last 200 lines)
+const LOG_BUFFER = [];
 
 // ============================================================================
 // PERSISTENCE
@@ -154,7 +160,11 @@ function decrypt(b64) {
 
 function saveKeys() {
   try {
-    const payload = JSON.stringify(runtime.mexcKeys);
+    const payload = JSON.stringify({
+      apiKey:    runtime.mexcKeys.apiKey,
+      apiSecret: runtime.mexcKeys.apiSecret,
+      aiKey:     runtime.aiKey
+    });
     fs.writeFileSync(KEYS_FILE, encrypt(payload));
   } catch (e) {
     log('ERR', 'saveKeys: ' + e.message);
@@ -169,8 +179,14 @@ function loadKeys() {
         const k = JSON.parse(dec);
         runtime.mexcKeys.apiKey    = k.apiKey || '';
         runtime.mexcKeys.apiSecret = k.apiSecret || '';
-        log('INFO', 'MEXC keys loaded from disk');
+        runtime.aiKey              = k.aiKey   || '';
+        state.ai.hasKey            = !!runtime.aiKey;
+        log('INFO', `Keys loaded — MEXC: ${runtime.mexcKeys.apiKey ? '✓' : '✗'} | AI: ${runtime.aiKey ? '✓' : '✗'}`);
+      } else {
+        log('WARN', 'Could not decrypt keys file — wrong ENC_PASSPHRASE?');
       }
+    } else {
+      log('INFO', 'No saved keys file yet (first run)');
     }
   } catch (e) {
     log('ERR', 'loadKeys: ' + e.message);
@@ -183,7 +199,10 @@ function loadKeys() {
 
 function log(level, msg) {
   const stamp = new Date().toISOString();
-  console.log(`[${stamp}] [${level}] ${msg}`);
+  const line = `[${stamp}] [${level}] ${msg}`;
+  console.log(line);
+  LOG_BUFFER.push({ t: stamp, level, msg });
+  if (LOG_BUFFER.length > LOG_BUFFER_SIZE) LOG_BUFFER.shift();
 }
 
 // ============================================================================
@@ -397,6 +416,39 @@ function validateAIResponse(ai, setup) {
     return { ok: false, reason: 'invalid_levels_short' };
   }
   return { ok: true };
+}
+
+async function testDeepSeek() {
+  if (!runtime.aiKey) return { ok: false, msg: 'No DeepSeek key saved' };
+
+  const reqBody = JSON.stringify({
+    model: 'deepseek-chat',
+    messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
+    max_tokens: 5
+  });
+
+  try {
+    const res = await httpsRequest(DEEPSEEK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': 'Bearer ' + runtime.aiKey
+      }
+    }, reqBody, 8000);
+
+    if (res.status === 401) return { ok: false, msg: 'Invalid API key (401 Unauthorized)' };
+    if (res.status === 402) return { ok: false, msg: 'No balance on DeepSeek account — top up at platform.deepseek.com' };
+    if (res.status !== 200) return { ok: false, msg: 'HTTP ' + res.status };
+
+    const j = JSON.parse(res.body);
+    if (j.choices && j.choices[0]) {
+      const reply = j.choices[0].message.content.trim();
+      return { ok: true, msg: 'DeepSeek responded: "' + reply + '"' };
+    }
+    return { ok: false, msg: 'No choices in response' };
+  } catch (e) {
+    return { ok: false, msg: 'Network error: ' + e.message };
+  }
 }
 
 // ============================================================================
@@ -922,20 +974,38 @@ async function tick() {
   }
 }
 
+async function refreshBalance() {
+  if (!runtime.mexcKeys.apiKey) {
+    state.balance.error = 'no_mexc_keys';
+    return;
+  }
+  try {
+    const bal = await mexcGetBalance();
+    state.balance.usdt      = bal;
+    state.balance.fetchedAt = Date.now();
+    state.balance.error     = null;
+  } catch (e) {
+    state.balance.error = e.message;
+  }
+}
+
 function startEngine() {
   if (runtime.intervals.tick) return;
   state.running.futures = true;
-  runtime.intervals.tick = setInterval(tick, TICK_INTERVAL);
-  runtime.intervals.sync = setInterval(syncWithMEXC, SYNC_INTERVAL);
-  runtime.intervals.save = setInterval(saveState, STATE_SAVE_MS);
+  runtime.intervals.tick    = setInterval(tick, TICK_INTERVAL);
+  runtime.intervals.sync    = setInterval(syncWithMEXC, SYNC_INTERVAL);
+  runtime.intervals.save    = setInterval(saveState, STATE_SAVE_MS);
+  runtime.intervals.balance = setInterval(refreshBalance, BALANCE_FETCH_MS);
+  refreshBalance().catch(()=>{});
   log('INFO', '== ENGINE STARTED ==');
 }
 
 function stopEngine() {
   state.running.futures = false;
-  if (runtime.intervals.tick) { clearInterval(runtime.intervals.tick); runtime.intervals.tick = null; }
-  if (runtime.intervals.sync) { clearInterval(runtime.intervals.sync); runtime.intervals.sync = null; }
-  if (runtime.intervals.save) { clearInterval(runtime.intervals.save); runtime.intervals.save = null; }
+  if (runtime.intervals.tick)    { clearInterval(runtime.intervals.tick);    runtime.intervals.tick    = null; }
+  if (runtime.intervals.sync)    { clearInterval(runtime.intervals.sync);    runtime.intervals.sync    = null; }
+  if (runtime.intervals.save)    { clearInterval(runtime.intervals.save);    runtime.intervals.save    = null; }
+  if (runtime.intervals.balance) { clearInterval(runtime.intervals.balance); runtime.intervals.balance = null; }
   log('INFO', '== ENGINE STOPPED ==');
 }
 
@@ -989,7 +1059,9 @@ const server = http.createServer(async (req, res) => {
         config: state.config,
         stats: state.stats,
         ai: { confidence: state.config.aiMinConfidence, hasKey: !!runtime.aiKey, lastDecision: state.ai.lastDecision },
+        balance: state.balance,
         positions: state.positions,
+        trades: { recent: state.trades.futures.slice(-20).concat(state.trades.paper.slice(-20)) },
         lastTick: state.lastTick,
         candles: state.candles.slice(-5),
         currentCandle: state.currentCandle,
@@ -1027,14 +1099,29 @@ const server = http.createServer(async (req, res) => {
       if (body.apiKey)    runtime.mexcKeys.apiKey = body.apiKey;
       if (body.apiSecret) runtime.mexcKeys.apiSecret = body.apiSecret;
       saveKeys();
+      refreshBalance().catch(()=>{});   // fetch balance right away
       return send(res, 200, { ok: true });
     }
     if (path === '/setaikey' && req.method === 'POST') {
       const body = await readBody(req);
       runtime.aiKey = body.aiKey || '';
       state.ai.hasKey = !!runtime.aiKey;
+      saveKeys();    // <-- now persists AI key to encrypted file
       saveState();
       return send(res, 200, { ok: true, hasKey: !!runtime.aiKey });
+    }
+    if (path === '/testai') {
+      const r = await testDeepSeek();
+      return send(res, 200, r);
+    }
+    if (path === '/logs') {
+      // Optional ?n=50 query param, default 100
+      const n = Math.min(parseInt(url.searchParams.get('n') || '100'), LOG_BUFFER_SIZE);
+      return send(res, 200, { logs: LOG_BUFFER.slice(-n) });
+    }
+    if (path === '/refreshbalance') {
+      await refreshBalance();
+      return send(res, 200, { balance: state.balance });
     }
     if (path === '/setlive')  { state.modes.futuresLive = true;  state.modes.paperMode = false; saveState(); return send(res, 200, { ok: true, modes: state.modes }); }
     if (path === '/setpaper') { state.modes.futuresLive = false; state.modes.paperMode = true;  saveState(); return send(res, 200, { ok: true, modes: state.modes }); }
