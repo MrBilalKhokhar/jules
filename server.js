@@ -1,8 +1,29 @@
 // ============================================================================
-// CryptoBot Pro v10 — Automated BTC Futures Trading Bot
-// CRT (Candle Range Theory) + Mandatory DeepSeek AI Confirmation
-// Zero npm dependencies. Built on Node.js core modules only.
+//                         ★★★ CRYPTOBOT PRO v11.0 ★★★
+//                       BUILD: 2026-06-05  RELEASE-FINAL
 // ============================================================================
+//   HOW TO VERIFY THIS IS THE LATEST VERSION:
+//   ────────────────────────────────────────────────────────────────────
+//   1. On GitHub: this comment block must be the FIRST thing you see
+//      when you click server.js. If you see anything else first, the
+//      old file is still uploaded.
+//   2. In Railway deploy logs: look for "v11.0" in the startup banner.
+//   3. In browser: visit  YOUR_URL/version  — should return v11.0.
+//   ────────────────────────────────────────────────────────────────────
+//   FEATURES IN THIS BUILD:
+//     ✓ MEXC futures with correct HMAC signature
+//     ✓ Env-var key loading (no Volume needed)
+//     ✓ /version endpoint (public, no PIN)
+//     ✓ /mexcdebug endpoint (full request/response visibility)
+//     ✓ Test Connection (MEXC) + Test AI (DeepSeek) buttons
+//     ✓ Live wallet balance + 5-layer profit protection
+//     ✓ Auto-fix URL prefix in dashboard
+//     ✓ Zero npm dependencies
+// ============================================================================
+
+const BUILD_VERSION = 'v11.0';
+const BUILD_DATE    = '2026-06-05';
+const BUILD_TAG     = 'RELEASE-FINAL';
 
 const http   = require('http');
 const https  = require('https');
@@ -172,6 +193,22 @@ function saveKeys() {
 }
 
 function loadKeys() {
+  // 1) First check environment variables (set on Railway → Variables tab)
+  //    These survive every redeploy automatically and are the recommended way.
+  let envMexcKey    = process.env.MEXC_API_KEY    || '';
+  let envMexcSecret = process.env.MEXC_API_SECRET || '';
+  let envAiKey      = process.env.DEEPSEEK_API_KEY || '';
+
+  if (envMexcKey || envMexcSecret || envAiKey) {
+    if (envMexcKey)    runtime.mexcKeys.apiKey    = envMexcKey.trim().replace(/[\r\n\t]/g, '');
+    if (envMexcSecret) runtime.mexcKeys.apiSecret = envMexcSecret.trim().replace(/[\r\n\t]/g, '');
+    if (envAiKey)      runtime.aiKey              = envAiKey.trim().replace(/[\r\n\t]/g, '');
+    state.ai.hasKey = !!runtime.aiKey;
+    log('INFO', `Keys loaded from ENV vars — MEXC: ${runtime.mexcKeys.apiKey ? '✓' : '✗'} | AI: ${runtime.aiKey ? '✓' : '✗'}`);
+    return;
+  }
+
+  // 2) Fall back to the encrypted file on disk
   try {
     if (fs.existsSync(KEYS_FILE)) {
       const dec = decrypt(fs.readFileSync(KEYS_FILE, 'utf8'));
@@ -181,12 +218,12 @@ function loadKeys() {
         runtime.mexcKeys.apiSecret = k.apiSecret || '';
         runtime.aiKey              = k.aiKey   || '';
         state.ai.hasKey            = !!runtime.aiKey;
-        log('INFO', `Keys loaded — MEXC: ${runtime.mexcKeys.apiKey ? '✓' : '✗'} | AI: ${runtime.aiKey ? '✓' : '✗'}`);
+        log('INFO', `Keys loaded from disk — MEXC: ${runtime.mexcKeys.apiKey ? '✓' : '✗'} | AI: ${runtime.aiKey ? '✓' : '✗'}`);
       } else {
         log('WARN', 'Could not decrypt keys file — wrong ENC_PASSPHRASE?');
       }
     } else {
-      log('INFO', 'No saved keys file yet (first run)');
+      log('INFO', 'No saved keys file yet — set MEXC_API_KEY, MEXC_API_SECRET, DEEPSEEK_API_KEY env vars OR save via dashboard');
     }
   } catch (e) {
     log('ERR', 'loadKeys: ' + e.message);
@@ -236,10 +273,12 @@ function httpsRequest(urlStr, options = {}, body = null, timeoutMs = 10000) {
 // MEXC API
 // ============================================================================
 
-function mexcSign(params, secret) {
-  // MEXC signs sorted query string with HMAC-SHA256
-  const sorted = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
-  return crypto.createHmac('sha256', secret).update(sorted).digest('hex');
+function mexcSignFutures(apiKey, timestamp, paramsString, secret) {
+  // MEXC Contract/Futures v1: sign apiKey + timestamp + paramsString
+  // For GET, paramsString is the sorted "k=v&k=v" query string (no api_key, no req_time)
+  // For POST, paramsString is the JSON body string
+  const target = apiKey + timestamp + paramsString;
+  return crypto.createHmac('sha256', secret).update(target).digest('hex');
 }
 
 async function mexcPublicPrice(pair) {
@@ -259,26 +298,33 @@ async function mexcRequest(path, method, params = {}) {
   if (!runtime.mexcKeys.apiKey || !runtime.mexcKeys.apiSecret) {
     return { error: 'no_keys' };
   }
-  const ts = Date.now();
-  const reqTime = String(ts);
-  const signParams = { ...params, api_key: runtime.mexcKeys.apiKey, req_time: reqTime };
-  const sig = mexcSign(signParams, runtime.mexcKeys.apiSecret);
+
+  const apiKey  = runtime.mexcKeys.apiKey;
+  const reqTime = String(Date.now());
 
   let url = `${MEXC_BASE}${path}`;
+  let bodyStr = null;
+  let paramsString = '';
+
+  if (method === 'GET') {
+    // Sort params alphabetically, build "k=v&k=v" — no encoding (MEXC futures spec)
+    const keys = Object.keys(params).sort();
+    paramsString = keys.map(k => `${k}=${params[k]}`).join('&');
+    if (paramsString) url += '?' + paramsString;
+  } else {
+    // POST: sign the JSON body as-is
+    bodyStr = JSON.stringify(params);
+    paramsString = bodyStr;
+  }
+
+  const sig = mexcSignFutures(apiKey, reqTime, paramsString, runtime.mexcKeys.apiSecret);
+
   const headers = {
-    'ApiKey':       runtime.mexcKeys.apiKey,
+    'ApiKey':       apiKey,
     'Request-Time': reqTime,
     'Signature':    sig,
     'Content-Type': 'application/json'
   };
-
-  let bodyStr = null;
-  if (method === 'GET') {
-    const qs = Object.keys(params).map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
-    if (qs) url += '?' + qs;
-  } else {
-    bodyStr = JSON.stringify(params);
-  }
 
   try {
     const res = await httpsRequest(url, { method, headers }, bodyStr, 8000);
@@ -315,10 +361,25 @@ async function mexcClosePosition(positionId) {
 }
 
 async function mexcTestConnection() {
+  if (!runtime.mexcKeys.apiKey || !runtime.mexcKeys.apiSecret) {
+    return { ok: false, msg: 'No MEXC keys saved' };
+  }
   const r = await mexcRequest('/api/v1/private/account/assets', 'GET', {});
-  if (r && r.success) return { ok: true };
-  if (r && r.code)    return { ok: false, code: r.code, msg: r.message || 'auth failed' };
-  return { ok: false, msg: r.error || 'unknown' };
+  if (r && r.success === true) {
+    // Find USDT balance for confirmation
+    let usdt = 0;
+    if (Array.isArray(r.data)) {
+      const u = r.data.find(a => a.currency === 'USDT');
+      if (u) usdt = parseFloat(u.availableBalance || 0);
+    }
+    return { ok: true, msg: `Connected ✓  USDT futures balance: $${usdt.toFixed(2)}` };
+  }
+  if (r && r.code) {
+    // MEXC error codes: 700001=signature, 700002=auth, 600=permission, etc.
+    return { ok: false, msg: `MEXC error ${r.code}: ${r.message || 'unknown'}` };
+  }
+  if (r && r.error) return { ok: false, msg: 'Network: ' + r.error };
+  return { ok: false, msg: 'Unknown response: ' + JSON.stringify(r).slice(0, 200) };
 }
 
 async function mexcGetBalance() {
@@ -1045,8 +1106,15 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const path = url.pathname;
 
-    // Public endpoints
-    if (path === '/ping')   return send(res, 200, { ok: true, version: '10.0.0' });
+    // Public endpoints (no PIN required)
+    if (path === '/ping')   return send(res, 200, { ok: true, version: BUILD_VERSION });
+    if (path === '/version') return send(res, 200, {
+      version: BUILD_VERSION,
+      date:    BUILD_DATE,
+      tag:     BUILD_TAG,
+      uptime:  Math.floor(process.uptime()),
+      hint:    'If you see this, the v11 build IS deployed and running.'
+    });
     if (path === '/prices') return send(res, 200, { price: state.lastTick, pair: state.config.pair });
 
     // All others require PIN
@@ -1059,6 +1127,7 @@ const server = http.createServer(async (req, res) => {
         config: state.config,
         stats: state.stats,
         ai: { confidence: state.config.aiMinConfidence, hasKey: !!runtime.aiKey, lastDecision: state.ai.lastDecision },
+        mexc: { hasKey: !!(runtime.mexcKeys.apiKey && runtime.mexcKeys.apiSecret) },
         balance: state.balance,
         positions: state.positions,
         trades: { recent: state.trades.futures.slice(-20).concat(state.trades.paper.slice(-20)) },
@@ -1096,11 +1165,61 @@ const server = http.createServer(async (req, res) => {
     }
     if (path === '/savekeys' && req.method === 'POST') {
       const body = await readBody(req);
-      if (body.apiKey)    runtime.mexcKeys.apiKey = body.apiKey;
-      if (body.apiSecret) runtime.mexcKeys.apiSecret = body.apiSecret;
+      // Trim whitespace and strip any non-printable chars that paste sometimes adds
+      if (body.apiKey)    runtime.mexcKeys.apiKey    = String(body.apiKey).trim().replace(/[\r\n\t]/g, '');
+      if (body.apiSecret) runtime.mexcKeys.apiSecret = String(body.apiSecret).trim().replace(/[\r\n\t]/g, '');
       saveKeys();
       refreshBalance().catch(()=>{});   // fetch balance right away
-      return send(res, 200, { ok: true });
+      return send(res, 200, {
+        ok: true,
+        apiKeyLen:    runtime.mexcKeys.apiKey.length,
+        apiSecretLen: runtime.mexcKeys.apiSecret.length,
+        apiKeyHead:   runtime.mexcKeys.apiKey.slice(0, 4),
+        apiKeyTail:   runtime.mexcKeys.apiKey.slice(-4)
+      });
+    }
+    if (path === '/mexcdebug') {
+      // Diagnostic endpoint: shows exactly what is sent to MEXC and what comes back
+      if (!runtime.mexcKeys.apiKey || !runtime.mexcKeys.apiSecret) {
+        return send(res, 200, { ok: false, msg: 'no_keys' });
+      }
+      const reqTime = String(Date.now());
+      const apiKey = runtime.mexcKeys.apiKey;
+      const paramsString = '';
+      const signTarget = apiKey + reqTime + paramsString;
+      const sig = crypto.createHmac('sha256', runtime.mexcKeys.apiSecret).update(signTarget).digest('hex');
+      const targetUrl = `${MEXC_BASE}/api/v1/private/account/assets`;
+      const headers = {
+        'ApiKey':       apiKey,
+        'Request-Time': reqTime,
+        'Signature':    sig,
+        'Content-Type': 'application/json'
+      };
+      let response;
+      try {
+        const res2 = await httpsRequest(targetUrl, { method: 'GET', headers }, null, 8000);
+        response = { status: res2.status, body: res2.body };
+      } catch (e) {
+        response = { error: e.message };
+      }
+      return send(res, 200, {
+        ok: true,
+        sent: {
+          url: targetUrl,
+          method: 'GET',
+          headers: {
+            ApiKey:       apiKey.slice(0, 4) + '...' + apiKey.slice(-4) + ` (len ${apiKey.length})`,
+            'Request-Time': reqTime,
+            Signature:    sig.slice(0, 8) + '...' + sig.slice(-8) + ` (len ${sig.length})`,
+            'Content-Type': 'application/json'
+          },
+          signTarget:     apiKey.slice(0, 4) + '...' + apiKey.slice(-4) + ' + ' + reqTime + ' + "' + paramsString + '"',
+          apiSecretLen:   runtime.mexcKeys.apiSecret.length,
+          apiSecretHead:  runtime.mexcKeys.apiSecret.slice(0, 4),
+          apiSecretTail:  runtime.mexcKeys.apiSecret.slice(-4)
+        },
+        response
+      });
     }
     if (path === '/setaikey' && req.method === 'POST') {
       const body = await readBody(req);
@@ -1218,12 +1337,16 @@ loadKeys();
 resetLocksOnRestart();
 
 server.listen(PORT, () => {
-  log('INFO', `========================================`);
-  log('INFO', `CryptoBot Pro v10 listening on :${PORT}`);
-  log('INFO', `PIN: ${BOT_PIN}`);
+  log('INFO', `=============================================================`);
+  log('INFO', `   ★ ★ ★   CRYPTOBOT PRO  ${BUILD_VERSION}  ${BUILD_TAG}   ★ ★ ★`);
+  log('INFO', `   Build date: ${BUILD_DATE}`);
+  log('INFO', `   If you see this banner, the v11 build IS running ✓`);
+  log('INFO', `   Verify externally: visit  YOUR_URL/version  in a browser`);
+  log('INFO', `=============================================================`);
+  log('INFO', `Listening on :${PORT}  |  PIN: ${BOT_PIN}`);
   log('INFO', `Pair: ${state.config.pair} | Capital: $${state.config.capital} | Leverage: ${state.config.leverage}x`);
-  log('INFO', `Mode: ${state.modes.futuresLive ? 'LIVE' : 'PAPER'} | AI key: ${runtime.aiKey ? 'set' : 'MISSING'}`);
-  log('INFO', `========================================`);
+  log('INFO', `Mode: ${state.modes.futuresLive ? 'LIVE' : 'PAPER'} | MEXC key: ${runtime.mexcKeys.apiKey ? 'set' : 'MISSING'} | AI key: ${runtime.aiKey ? 'set' : 'MISSING'}`);
+  log('INFO', `=============================================================`);
 
   // If we were running before restart, resume
   if (state.running.futures) {
